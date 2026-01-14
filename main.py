@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 
 from rapidfuzz import fuzz
+from google.cloud import firestore
 
 # --------------------
 # App setup
@@ -13,11 +14,17 @@ from rapidfuzz import fuzz
 app = FastAPI(
     title="Course to Skills API",
     description="Maps course descriptions to canonical course identifiers",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 # --------------------
-# Load course data (once at startup)
+# Firestore client
+# --------------------
+
+db = firestore.Client()
+
+# --------------------
+# Load course alias data (once at startup)
 # --------------------
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,10 +41,12 @@ class CourseRequest(BaseModel):
     course_name: str
     course_code: str
 
-class MatchResponse(BaseModel):
-    cuuid: Optional[str]
-    name_score: float
-    code_score: float
+
+class CourseSkillsResponse(BaseModel):
+    cuuid: str
+    skills: List[str]
+    avg_similarity: float
+
 
 # --------------------
 # Matching logic
@@ -47,13 +56,12 @@ NAME_THRESHOLD = 80.0
 CODE_THRESHOLD = 90.0
 
 
-def find_best_match(course_name: str, course_code: str) -> MatchResponse:
-    best_match = None
+def find_best_match(course_name: str, course_code: str) -> Optional[tuple]:
+    best_cuuid = None
     best_name_score = 0.0
     best_code_score = 0.0
 
     for course in COURSES:
-        # Match against ALL known aliases
         name_scores = [
             fuzz.token_set_ratio(course_name, name)
             for name in course.get("Names", [])
@@ -69,21 +77,31 @@ def find_best_match(course_name: str, course_code: str) -> MatchResponse:
         name_score = max(name_scores)
         code_score = max(code_scores)
 
-        # Require BOTH name and code to pass threshold
         if (
             name_score >= NAME_THRESHOLD
             and code_score >= CODE_THRESHOLD
             and (name_score + code_score) > (best_name_score + best_code_score)
         ):
-            best_match = course["CUUID"]
+            best_cuuid = course["CUUID"]
             best_name_score = name_score
             best_code_score = code_score
 
-    return MatchResponse(
-        cuuid=best_match,
-        name_score=best_name_score,
-        code_score=best_code_score,
-    )
+    if best_cuuid is None:
+        return None
+
+    avg_similarity = (best_name_score + best_code_score) / 2.0
+
+    return best_cuuid, avg_similarity
+
+
+def get_skills_by_cuuid(cuuid: str) -> List[str]:
+    doc = db.collection("courses").document(cuuid).get()
+
+    if not doc.exists:
+        return []
+
+    return doc.to_dict().get("Skills", [])
+
 
 # --------------------
 # Routes
@@ -93,21 +111,36 @@ def find_best_match(course_name: str, course_code: str) -> MatchResponse:
 def root():
     return {"service": "course-skill-mapping", "status": "running"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/course_to_skills", response_model=MatchResponse)
+
+@app.post("/course_to_skills", response_model=CourseSkillsResponse)
 def course_to_skills(request: CourseRequest):
-    result = find_best_match(
+    match = find_best_match(
         course_name=request.course_name,
         course_code=request.course_code,
     )
 
-    if result.cuuid is None:
+    if match is None:
         raise HTTPException(
             status_code=404,
             detail="No sufficiently confident course match found",
         )
 
-    return result
+    cuuid, avg_similarity = match
+    skills = get_skills_by_cuuid(cuuid)
+
+    if not skills:
+        raise HTTPException(
+            status_code=404,
+            detail="Course matched but no skills found in Firestore",
+        )
+
+    return CourseSkillsResponse(
+        cuuid=cuuid,
+        skills=skills,
+        avg_similarity=avg_similarity
+    )
